@@ -1,0 +1,60 @@
+Bonus requests — ex3, submitters 322526864_323020347
+=====================================================
+
+All bonuses below are implemented on top of the complete core requirements, each with its own
+test filter in the included suites (build with -DDRONE_BUILD_TESTS=ON; run from any directory).
+The visual-simulation tool bonus was claimed and granted in assignment 2 and is NOT re-requested.
+
+1) Optional error-handling rows of the "Common Issues and Handling" table
+   Rows implemented: 2, 3, 4, 6, 7, 8, 10, 11, 12 (all optional rows; the mandatory rows 1 and
+   5 and the row-9 logging are core).
+   Where: guard functions around DroneControlImpl::step() (MissionControl project), with the
+   escalation exception family (FatalMissionError) propagating through runMission to the
+   simulation run, which scores the run -1.
+   Details:
+     - Row 2: a movement whose destination leaves the MAP is ignored entirely (driver not called).
+     - Row 3: invalid command values (NaN/Inf/negative) — skipped and retried; 3rd consecutive
+       is fatal.
+     - Row 4: empty command (no movement AND no scan, "NOOP") — tolerated; 3rd consecutive fatal.
+     - Row 6: empty lidar scan — up to 3 in-step retries, never clobbers the stored scan; 3rd
+       consecutive all-empty scanning step is fatal.
+     - Row 7: movement driver returns false — step Error (mission logs and continues); 3rd
+       consecutive failure escalates to fatal.
+     - Row 8: over-limit movement split into per-step chunks (e.g. 120cm at max 50 → 50+50+20,
+       each its own counted step, algorithm consulted once); a failed chunk drops the remainder.
+     - Row 10: a translation that would exit the MISSION bounds is amended to the longest
+       whole-cell prefix that stays inside (possibly a no-op).
+     - Row 11: out-of-bounds GPS reading — ignored in favor of the internal dead-reckoning
+       estimate; fatal only when both are out of bounds.
+     - Row 12: impossible (non-finite) GPS reading after an executed movement — up to 3 re-reads,
+       then the step reports Error.
+   N ("throw after N tries", value left to us) = 3 consecutive faults of the same kind.
+   How to check: mission_control_tests --gtest_filter='DroneControl.ErrorHandling*'
+                 (plus MissionControl.ThreeConsecutiveDriverFailuresAbortFatally for the
+                 propagate-and-save path). 21 dedicated tests.
+
+2) Different-resolution output maps (unclaimed ex2 bonus, completed in ex3)
+   An integer output_mapping_resolution_factor > 1 is ACCEPTED and the output map is genuinely
+   produced at native_resolution × factor — the planner grid, cell-aligned movement, scan
+   writes, scoring comparison, and the saved .npy all operate at the coarser resolution
+   (factor < 1 → IgnoredTooSmall; non-integer → Ignored; both logged, native resolution kept).
+   Cross-resolution scoring needs no special casing — comparison queries by world coordinate —
+   and is pinned by tests.
+   How to check: simulator_tests --gtest_filter='SimulationRunTest.Resolution*:MapsComparison.DifferentResolution*'
+   Live demo: add "output_mapping_resolution_factor: 2" to any mission yaml and run either mode:
+   the run's report shows resolution_request_status: Accepted and the output .npy shape shrinks
+   by the factor on every axis.
+
+3) Grouped plugin lifecycle — load once, unload when unused (spec-flagged bonus)
+   The spec's threading section offers a bonus for avoiding loading all .so files simultaneously:
+   loading each only when needed, once, and unloading it when no longer used — never reloading.
+   Implemented as a grouped-by-plugin pipeline in both modes: the fixed-side plugin loads once
+   for the whole invocation; each varying-side plugin is dlopen'd once when its group starts,
+   its full simulation matrix fans out across the worker pool, and after the join its factory is
+   destroyed and the .so is dlclose'd — before the next plugin is loaded, and with every created
+   instance already dead. Single-threaded and threaded runs share this exact code path, and the
+   outputs remain byte-identical to the load-everything-up-front design.
+   How to check: simulator_tests --gtest_filter='Integration.PluginLifecycle*'
+   (an instrumented fixture .so logs its own dlopen/dlclose moments; the tests assert the exact
+   load A → unload A → load B → unload B sequence, single- and multi-threaded, including broken
+   plugins interleaved). The lifecycle path is AddressSanitizer-clean.

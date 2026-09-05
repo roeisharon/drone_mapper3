@@ -1,0 +1,480 @@
+#include "report/MapsComparison.h"
+
+#include "map/Map3DImpl.h"
+
+#include <Common/IMap3D.h>
+#include <Common/Types.h>
+#include <Common/Units.h>
+
+#include <TinyNPY.h>
+#include <gtest/gtest.h>
+
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <vector>
+
+// Units come in bare via "using namespace common"; production classes via using-declarations;
+// staff data types are always spelled common::types::X in full.
+
+using namespace common;
+using simulator::Map3DImpl;
+using simulator::MapsComparison;
+
+namespace {
+
+// Absolute path of a read-only fixture map inside the hermetic test-data directory.
+std::string dataPath(const char* file_name) {
+    return (std::filesystem::path{DRONE_TEST_DATA_DIR} / file_name).string();
+}
+
+// Build an n_x x n_y x n_z output-style map at 1 cm/voxel, no offset. Boundaries are set
+// explicitly because compare() iterates them from origin.getMapConfig(); the config-only ctor
+// means every voxel starts Unmapped until set().
+std::unique_ptr<Map3DImpl> makeMap(int n_x, int n_y, int n_z) {
+    const common::types::MapConfig cfg{
+        common::types::MappingBounds{
+            0.0 * x_extent[cm], static_cast<double>(n_x) * x_extent[cm],
+            0.0 * y_extent[cm], static_cast<double>(n_y) * y_extent[cm],
+            0.0 * z_extent[cm], static_cast<double>(n_z) * z_extent[cm]
+        },
+        Position3D{},
+        1.0 * cm
+    };
+    return std::make_unique<Map3DImpl>(cfg);
+}
+
+// Write val at grid index (ix, iy, iz), addressing the voxel centre so atVoxel() is unambiguous.
+void setVoxel(Map3DImpl& m, int ix, int iy, int iz, common::types::VoxelOccupancy val) {
+    m.set({(static_cast<double>(ix) + 0.5) * x_extent[cm],
+           (static_cast<double>(iy) + 0.5) * y_extent[cm],
+           (static_cast<double>(iz) + 0.5) * z_extent[cm]},
+          val);
+}
+
+// Fill every voxel of an n_x x n_y x n_z map with one value.
+void fillAll(Map3DImpl& m, int n_x, int n_y, int n_z, common::types::VoxelOccupancy val) {
+    for (int x = 0; x < n_x; ++x)
+        for (int y = 0; y < n_y; ++y)
+            for (int z = 0; z < n_z; ++z)
+                setVoxel(m, x, y, z, val);
+}
+
+// Minimal hand-rolled IMap3D whose config reports zero resolution. Replaces the ex2 gmock
+// NiceMock<MockIMap3D> (these ex3 test files are gtest-only) for the compare() guard test.
+class ZeroResolutionMap final : public common::IMap3D {
+public:
+    [[nodiscard]] common::types::VoxelOccupancy atVoxel(const Position3D&) const override {
+        return common::types::VoxelOccupancy::Unmapped;
+    }
+    [[nodiscard]] common::types::MapConfig getMapConfig() const override {
+        return common::types::MapConfig{common::types::MappingBounds{}, Position3D{}, 0.0 * cm};
+    }
+    [[nodiscard]] bool isInBounds(const Position3D&) const override {
+        return false;
+    }
+};
+
+} // namespace
+
+// Basic score correctness
+
+// Two identical all-Empty maps score 100.
+TEST(MapsComparison, IdenticalMapsGive100) {
+    auto origin = makeMap(3, 3, 1);
+    auto target = makeMap(3, 3, 1);
+    fillAll(*origin, 3, 3, 1, common::types::VoxelOccupancy::Empty);
+    fillAll(*target, 3, 3, 1, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {target.get()});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 100.0);
+}
+
+// A fully-Unmapped target matches no origin voxel and scores 0.
+TEST(MapsComparison, FullyUnmappedTargetGives0) {
+    auto origin = makeMap(3, 3, 1);
+    auto target = makeMap(3, 3, 1);
+    fillAll(*origin, 3, 3, 1, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {target.get()});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 0.0);
+}
+
+// Half-matching target scores proportionally (3 of 6 mappable → 50).
+TEST(MapsComparison, PartiallyMappedTargetCorrectScore) {
+    auto origin = makeMap(3, 2, 1);
+    auto target = makeMap(3, 2, 1);
+    fillAll(*origin, 3, 2, 1, common::types::VoxelOccupancy::Empty);
+    setVoxel(*target, 0, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*target, 1, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*target, 2, 0, 0, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {target.get()});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 50.0);
+}
+
+// An all-Unmapped origin has zero mappable voxels → score 0 (no division by zero).
+TEST(MapsComparison, OriginAllUnmappedGives0) {
+    auto origin = makeMap(3, 3, 1);
+    auto target = makeMap(3, 3, 1);
+    fillAll(*target, 3, 3, 1, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {target.get()});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 0.0);
+}
+
+// Observable Occupied voxels (adjacent to an Empty voxel) that match correctly score 100.
+// In a 3x1x1 map [Empty, Occupied, Occupied], only [0] and [1] are observable:
+// [0] is Empty; [1] has an Empty neighbor at [0]; [2] is interior (no Empty neighbor).
+TEST(MapsComparison, ObservableSurfaceOccupiedMatchesGives100) {
+    auto origin = makeMap(3, 1, 1);
+    auto target = makeMap(3, 1, 1);
+    setVoxel(*origin, 0, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*origin, 1, 0, 0, common::types::VoxelOccupancy::Occupied);
+    setVoxel(*origin, 2, 0, 0, common::types::VoxelOccupancy::Occupied);
+    setVoxel(*target, 0, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*target, 1, 0, 0, common::types::VoxelOccupancy::Occupied);
+    setVoxel(*target, 2, 0, 0, common::types::VoxelOccupancy::Occupied);
+
+    const auto scores = MapsComparison::compare(*origin, {target.get()});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 100.0);
+}
+
+// Occupied origin vs wrong-value target: both observable slots wrong → 0.
+// 2x1x1: origin=[Empty, Occupied], target=[Occupied, Empty]; both voxels mismatch.
+TEST(MapsComparison, AllObservableVoxelsMismatchGives0) {
+    auto origin = makeMap(2, 1, 1);
+    auto target = makeMap(2, 1, 1);
+    setVoxel(*origin, 0, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*origin, 1, 0, 0, common::types::VoxelOccupancy::Occupied);
+    setVoxel(*target, 0, 0, 0, common::types::VoxelOccupancy::Occupied);
+    setVoxel(*target, 1, 0, 0, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {target.get()});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 0.0);
+}
+
+// Mixed origin values are each compared by exact value (1 of 2 matches → 50).
+TEST(MapsComparison, MixedOriginCorrectScore) {
+    auto origin = makeMap(2, 1, 1);
+    auto target = makeMap(2, 1, 1);
+    setVoxel(*origin, 0, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*origin, 1, 0, 0, common::types::VoxelOccupancy::Occupied);
+    setVoxel(*target, 0, 0, 0, common::types::VoxelOccupancy::Occupied);
+    setVoxel(*target, 1, 0, 0, common::types::VoxelOccupancy::Occupied);
+
+    const auto scores = MapsComparison::compare(*origin, {target.get()});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 50.0);
+}
+
+// Origin skip behaviour
+
+// Unmapped origin voxels are excluded from the denominator (and not rewarded in the target).
+TEST(MapsComparison, UnmappedOriginVoxelsNotCounted) {
+    auto origin = makeMap(3, 1, 1);
+    auto target = makeMap(3, 1, 1);
+    setVoxel(*origin, 0, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*origin, 1, 0, 0, common::types::VoxelOccupancy::Empty);
+    fillAll(*target, 3, 1, 1, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {target.get()});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 100.0);
+}
+
+// PotentiallyOccupied scoring policy: exact-match. Where origin is Empty, a target
+// PotentiallyOccupied is a miss; where origin is PotentiallyOccupied it matches.
+// 2x1x1: origin=[Empty, PotentiallyOccupied], target=[PO, PO] → 1 of 2 matches → 50.
+// (The interior-exclusion only applies to Occupied voxels, so PO in origin is always counted.)
+TEST(MapsComparison, PotentiallyOccupiedHandledPerPolicy) {
+    auto origin = makeMap(2, 1, 1);
+    auto target = makeMap(2, 1, 1);
+    setVoxel(*origin, 0, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*origin, 1, 0, 0, common::types::VoxelOccupancy::PotentiallyOccupied);
+    setVoxel(*target, 0, 0, 0, common::types::VoxelOccupancy::PotentiallyOccupied);
+    setVoxel(*target, 1, 0, 0, common::types::VoxelOccupancy::PotentiallyOccupied);
+
+    const auto scores = MapsComparison::compare(*origin, {target.get()});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 50.0);
+}
+
+// A zero-resolution origin config must not loop forever — compare() guards and returns 0.
+TEST(MapsComparison, ZeroResolutionOriginReturnsZeroScores) {
+    const ZeroResolutionMap origin;
+    const ZeroResolutionMap target;
+
+    const auto scores = MapsComparison::compare(origin, {&target});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 0.0);
+}
+
+// Multiple targets
+
+// An empty target vector yields an empty score vector.
+TEST(MapsComparison, EmptyTargetVectorReturnsEmpty) {
+    auto origin = makeMap(3, 3, 1);
+    fillAll(*origin, 3, 3, 1, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {});
+    EXPECT_TRUE(scores.empty());
+}
+
+// Two targets produce exactly two scores.
+TEST(MapsComparison, TwoTargetsReturnTwoScores) {
+    auto origin  = makeMap(3, 3, 1);
+    auto target1 = makeMap(3, 3, 1);
+    auto target2 = makeMap(3, 3, 1);
+    fillAll(*origin, 3, 3, 1, common::types::VoxelOccupancy::Empty);
+    fillAll(*target1, 3, 3, 1, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {target1.get(), target2.get()});
+    EXPECT_EQ(scores.size(), 2u);
+}
+
+// Each target is scored independently against the same origin (100 and 0).
+TEST(MapsComparison, TwoTargetsScoredIndependently) {
+    auto origin  = makeMap(4, 1, 1);
+    auto target1 = makeMap(4, 1, 1);
+    auto target2 = makeMap(4, 1, 1);
+    fillAll(*origin, 4, 1, 1, common::types::VoxelOccupancy::Empty);
+    fillAll(*target1, 4, 1, 1, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {target1.get(), target2.get()});
+    ASSERT_EQ(scores.size(), 2u);
+    EXPECT_DOUBLE_EQ(scores[0], 100.0);
+    EXPECT_DOUBLE_EQ(scores[1], 0.0);
+}
+
+// Two partially-matching targets get distinct proportional scores (75 and 25).
+TEST(MapsComparison, TwoTargetsBothPartiallyMatch) {
+    auto origin  = makeMap(4, 1, 1);
+    auto target1 = makeMap(4, 1, 1);
+    auto target2 = makeMap(4, 1, 1);
+    fillAll(*origin, 4, 1, 1, common::types::VoxelOccupancy::Empty);
+    setVoxel(*target1, 0, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*target1, 1, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*target1, 2, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*target2, 3, 0, 0, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {target1.get(), target2.get()});
+    ASSERT_EQ(scores.size(), 2u);
+    EXPECT_DOUBLE_EQ(scores[0], 75.0);
+    EXPECT_DOUBLE_EQ(scores[1], 25.0);
+}
+
+// Null-target guard (ex2 grading bug COM24)
+
+// A nullptr target alongside a valid one scores exactly -1.0 in its own slot while the valid
+// target is scored normally — a caller bug must not crash the comparison of the other targets.
+TEST(MapsComparison, NullTargetScoresMinusOne) {
+    auto origin = makeMap(3, 1, 1);
+    auto target = makeMap(3, 1, 1);
+    fillAll(*origin, 3, 1, 1, common::types::VoxelOccupancy::Empty);
+    fillAll(*target, 3, 1, 1, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {target.get(), nullptr});
+    ASSERT_EQ(scores.size(), 2u);
+    EXPECT_DOUBLE_EQ(scores[0], 100.0);
+    EXPECT_DOUBLE_EQ(scores[1], -1.0);
+}
+
+// A target list containing only nullptr yields exactly {-1.0}.
+TEST(MapsComparison, OnlyNullTargets) {
+    auto origin = makeMap(3, 1, 1);
+    fillAll(*origin, 3, 1, 1, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {nullptr});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], -1.0);
+}
+
+// Three pointers to the SAME perfect-copy target all score, and all equal the 1-target score —
+// guards against an off-by-one that silently skips the last target when more than two are passed.
+TEST(MapsComparison, ThreeIdenticalTargetsAllScored) {
+    auto origin = makeMap(3, 1, 1);
+    auto target = makeMap(3, 1, 1);
+    fillAll(*origin, 3, 1, 1, common::types::VoxelOccupancy::Empty);
+    fillAll(*target, 3, 1, 1, common::types::VoxelOccupancy::Empty);
+
+    const auto single = MapsComparison::compare(*origin, {target.get()});
+    ASSERT_EQ(single.size(), 1u);
+
+    const auto scores =
+        MapsComparison::compare(*origin, {target.get(), target.get(), target.get()});
+    ASSERT_EQ(scores.size(), 3u);
+    EXPECT_DOUBLE_EQ(scores[0], single[0]);
+    EXPECT_DOUBLE_EQ(scores[1], single[0]);
+    EXPECT_DOUBLE_EQ(scores[2], single[0]);
+    EXPECT_DOUBLE_EQ(scores[0], 100.0);
+}
+
+// Four mixed targets are scored element-wise: {perfect, all-Unmapped, perfect, nullptr}
+// → {100, 0, 100, -1}.
+TEST(MapsComparison, FourTargetsMixed) {
+    auto origin  = makeMap(4, 1, 1);
+    auto perfect = makeMap(4, 1, 1);
+    auto empty_t = makeMap(4, 1, 1); // stays all Unmapped
+    fillAll(*origin, 4, 1, 1, common::types::VoxelOccupancy::Empty);
+    fillAll(*perfect, 4, 1, 1, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(
+        *origin, {perfect.get(), empty_t.get(), perfect.get(), nullptr});
+    ASSERT_EQ(scores.size(), 4u);
+    EXPECT_DOUBLE_EQ(scores[0], 100.0);
+    EXPECT_DOUBLE_EQ(scores[1], 0.0);
+    EXPECT_DOUBLE_EQ(scores[2], 100.0);
+    EXPECT_DOUBLE_EQ(scores[3], -1.0);
+}
+
+// Correctness against real .npy data
+
+// A real fixture map compared with itself scores 100. NpyArray is move-only, so one loaded
+// array is passed by const reference to both map constructors (each copies the voxel data).
+TEST(MapsComparison, RealNpySelfCompareGives100) {
+    NpyArray npy;
+    const char* err = npy.LoadNPY(dataPath("single_voxel_x4_y4_z4.npy"));
+    ASSERT_EQ(err, nullptr) << "Failed to load fixture: " << (err ? err : "null");
+
+    const common::types::MapConfig cfg{common::types::MappingBounds{}, Position3D{}, 1.0 * cm};
+    Map3DImpl map_a{npy, cfg};
+    Map3DImpl map_b{npy, cfg};
+
+    const auto scores = MapsComparison::compare(map_a, {&map_b});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 100.0);
+}
+
+// A real fixture origin vs an all-Unmapped output map scores 0.
+TEST(MapsComparison, RealNpyAllUnmappedTargetLowScore) {
+    NpyArray npy;
+    ASSERT_EQ(npy.LoadNPY(dataPath("single_voxel_x4_y4_z4.npy")), nullptr);
+
+    const common::types::MapConfig cfg{common::types::MappingBounds{}, Position3D{}, 1.0 * cm};
+    Map3DImpl origin{npy, cfg};
+    Map3DImpl empty_target{origin.getMapConfig()};
+
+    const auto scores = MapsComparison::compare(origin, {&empty_target});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 0.0);
+}
+
+// Interior Occupied voxels (no Empty neighbor in origin) must not count against the score.
+// 3x1x1: [Empty, Occupied, Occupied]. Occupied[1] has Empty neighbour → observable.
+// Occupied[2] has only Occupied/OOB neighbours → interior → excluded.
+// Verifies that a perfectly-mapped target still reaches 100 despite the interior voxels.
+TEST(MapsComparison, InteriorOccupiedVoxelsExcludedFromScoring) {
+    auto origin = makeMap(3, 1, 1);
+    auto target = makeMap(3, 1, 1);
+    setVoxel(*origin, 0, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*origin, 1, 0, 0, common::types::VoxelOccupancy::Occupied);
+    setVoxel(*origin, 2, 0, 0, common::types::VoxelOccupancy::Occupied);
+    // Target correctly maps [0] and [1], but leaves [2] Unmapped (as a drone would).
+    setVoxel(*target, 0, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*target, 1, 0, 0, common::types::VoxelOccupancy::Occupied);
+
+    // [2] is not observable, so total_mappable=2 and both match → 100.
+    const auto scores = MapsComparison::compare(*origin, {target.get()});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 100.0);
+}
+
+// Mission-bounded scoring: a target covering only a sub-region of the origin is scored ONLY over that
+// region. Origin [0,3) all Empty; target covers just [0,1) and maps its one cell correctly → 100%
+// (NOT 1/3 = 33%, which is what counting the whole origin would give).
+TEST(MapsComparison, RestrictedTargetScoredOnlyOverItsRegion) {
+    auto origin = makeMap(3, 1, 1);
+    auto target = makeMap(1, 1, 1);          // covers only world [0,1)
+    fillAll(*origin, 3, 1, 1, common::types::VoxelOccupancy::Empty);
+    setVoxel(*target, 0, 0, 0, common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {target.get()});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 100.0);
+}
+
+// Comparison is by world coordinate, not array index: a restricted target with a DIFFERENT offset
+// (array index 0 at world 1) is still matched against the origin at the same world positions.
+TEST(MapsComparison, RestrictedTargetWithDifferentOffsetComparedByWorld) {
+    auto origin = makeMap(3, 1, 1);
+    fillAll(*origin, 3, 1, 1, common::types::VoxelOccupancy::Empty);
+
+    // Target covers only world [1,2); its offset -1 puts array index 0 at world 1.
+    const common::types::MapConfig tcfg{
+        common::types::MappingBounds{1.0 * x_extent[cm], 2.0 * x_extent[cm],
+                                     0.0 * y_extent[cm], 1.0 * y_extent[cm],
+                                     0.0 * z_extent[cm], 1.0 * z_extent[cm]},
+        Position3D{-1.0 * x_extent[cm], 0.0 * y_extent[cm], 0.0 * z_extent[cm]},
+        1.0 * cm};
+    Map3DImpl target{tcfg};
+    target.set({1.5 * x_extent[cm], 0.5 * y_extent[cm], 0.5 * z_extent[cm]},
+               common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {&target});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 100.0); // region [1,2): origin Empty == target Empty
+}
+
+// Phase 8b — cross-resolution comparison. compare() iterates the ORIGIN's grid and queries the
+// target by world position, so a coarser target answers each fine cell with its covering coarse
+// cell's value: no special-casing needed, pinned here.
+
+// A coarse (2cm) target whose every cell matches the homogeneous fine (1cm) origin scores 100:
+// each 2×2×1 fine block reads the one coarse cell that covers it.
+TEST(MapsComparison, DifferentResolutionHomogeneousBlocksGive100) {
+    auto origin = makeMap(4, 4, 1);
+    fillAll(*origin, 4, 4, 1, common::types::VoxelOccupancy::Empty);
+
+    // The coarse map's extent must hold whole 2cm cells, so its z spans [0,2) — extending past
+    // the origin's [0,1) is fine: scoring iterates the ORIGIN's region only.
+    const common::types::MapConfig coarse_cfg{
+        common::types::MappingBounds{0.0 * x_extent[cm], 4.0 * x_extent[cm],
+                                     0.0 * y_extent[cm], 4.0 * y_extent[cm],
+                                     0.0 * z_extent[cm], 2.0 * z_extent[cm]},
+        Position3D{},
+        2.0 * cm};
+    Map3DImpl target{coarse_cfg};
+    for (int x = 0; x < 2; ++x) {
+        for (int y = 0; y < 2; ++y) {
+            target.set({(2.0 * x + 1.0) * x_extent[cm], (2.0 * y + 1.0) * y_extent[cm],
+                        1.0 * z_extent[cm]},
+                       common::types::VoxelOccupancy::Empty);
+        }
+    }
+
+    const auto scores = MapsComparison::compare(*origin, {&target});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 100.0);
+}
+
+// A coarse cell holds ONE value for its whole block, so where the fine origin is heterogeneous
+// inside a block, exactly the mismatching fine cells count as misses — the honest cost of a
+// coarser output map. Origin: 2x1x1, cell 0 Empty + cell 1 Occupied (observable via its Empty
+// neighbor); target: one 2cm cell marked Empty → matches origin cell 0, misses cell 1 → 50.
+TEST(MapsComparison, DifferentResolutionHeterogeneousBlockScoresPartially) {
+    auto origin = makeMap(2, 1, 1);
+    setVoxel(*origin, 0, 0, 0, common::types::VoxelOccupancy::Empty);
+    setVoxel(*origin, 1, 0, 0, common::types::VoxelOccupancy::Occupied);
+
+    // One 2cm cell covering the whole origin: bounds sized to whole coarse cells on every axis.
+    const common::types::MapConfig coarse_cfg{
+        common::types::MappingBounds{0.0 * x_extent[cm], 2.0 * x_extent[cm],
+                                     0.0 * y_extent[cm], 2.0 * y_extent[cm],
+                                     0.0 * z_extent[cm], 2.0 * z_extent[cm]},
+        Position3D{},
+        2.0 * cm};
+    Map3DImpl target{coarse_cfg};
+    target.set({1.0 * x_extent[cm], 1.0 * y_extent[cm], 1.0 * z_extent[cm]},
+               common::types::VoxelOccupancy::Empty);
+
+    const auto scores = MapsComparison::compare(*origin, {&target});
+    ASSERT_EQ(scores.size(), 1u);
+    EXPECT_DOUBLE_EQ(scores[0], 50.0);
+}
