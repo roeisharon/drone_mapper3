@@ -1,6 +1,6 @@
 # Assignment 3 — Drone Mapper Simulator
 
-**Submitters:** Roei Sharon (322526864), Tomer Maizus (323020347)
+**Submitters:** Roei Sharon, Tomer Maizus
 
 A multithreaded simulator that dynamically loads MissionControl and Algorithm plugins (`.so`)
 and runs them over a composition matrix of simulations × missions × drones × lidars, in two
@@ -13,15 +13,15 @@ control × all algorithms).
 
 | Folder | Contents |
 |---|---|
-| `Simulator/` | the executable `simulator_322526864_323020347` (own CMakeLists) |
-| `Algorithm/` | `Algorithm_322526864_323020347.so` (own CMakeLists) |
-| `MissionControl/` | `MissionControl_322526864_323020347.so` (own CMakeLists) |
+| `Simulator/` | the executable `simulator_id1_id2` (own CMakeLists) |
+| `Algorithm/` | `Algorithm_id1_id2.so` (own CMakeLists) |
+| `MissionControl/` | `MissionControl_id1_id2.so` (own CMakeLists) |
 | `common/` | staff-published interfaces, used as-is, unmodified |
 | `UserCommon/` | our shared code (no makefile, per spec); consumers compile its sources directly |
 
 Namespaces are lowercase with ids preserved, per the forum clarification:
-`algorithm_322526864_323020347`, `mission_control_322526864_323020347`,
-`user_common_322526864_323020347`, and `simulator` for the executable-only code.
+`algorithm_id1_id2`, `mission_control_id1_id2`,
+`user_common_id1_id2`, and `simulator` for the executable-only code.
 
 ## Build
 
@@ -41,14 +41,14 @@ cmake -S Algorithm -B build_algo -G Ninja -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scr
 # same for MissionControl/ and Simulator/
 ```
 
-Artifacts (no `lib` prefix): `Algorithm_322526864_323020347.so`,
-`MissionControl_322526864_323020347.so`, `simulator_322526864_323020347`.
+Artifacts (no `lib` prefix): `Algorithm_id1_id2.so`,
+`MissionControl_id1_id2.so`, `simulator_id1_id2`.
 
 ## Run
 
 ```bash
-./simulator_322526864_323020347 -comparative simulation=<composition.yaml> mission_control_folder=<folder> algorithm=<algorithm.so> [num_threads=<n>] [-verbose]
-./simulator_322526864_323020347 -competition simulation=<composition.yaml> mission_control=<mission_control.so> algorithms_folder=<folder> [num_threads=<n>] [-verbose]
+./simulator_id1_id2 -comparative simulation=<composition.yaml> mission_control_folder=<folder> algorithm=<algorithm.so> [num_threads=<n>] [-verbose]
+./simulator_id1_id2 -competition simulation=<composition.yaml> mission_control=<mission_control.so> algorithms_folder=<folder> [num_threads=<n>] [-verbose]
 ```
 
 Arguments may appear in any order. Invalid invocations print a usage message listing **all**
@@ -122,5 +122,5 @@ and byte-identical thread-count determinism, alongside the algorithm/mission-con
 The Integration tests use the course-provided `inputs/` folder (included), e.g.:
 
 ```bash
-./build/default/Simulator/simulator_322526864_323020347 -comparative simulation=inputs/sim_compose.yaml mission_control_folder=<folder with MissionControl .so files> algorithm=build/default/Algorithm/Algorithm_322526864_323020347.so num_threads=4
+./build/default/Simulator/simulator_id1_id2 -comparative simulation=inputs/sim_compose.yaml mission_control_folder=<folder with MissionControl .so files> algorithm=build/default/Algorithm/Algorithm_id1_id2.so num_threads=4
 ```
